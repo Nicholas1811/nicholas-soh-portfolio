@@ -15,7 +15,7 @@ const links = [
 export default function Contact() {
   return (
     <section id="contact" className="relative mx-auto max-w-6xl px-6 pb-16 pt-28 md:px-14 md:pt-40">
-      <SectionHeading index="05" label="contact" title="Say hi." />
+      <SectionHeading index="06" label="contact" title="Say hi." />
 
       <motion.a
         data-interactive
