@@ -24,6 +24,12 @@
 .DS_Store
 *.pem
 
+# personal — contains phone number, keep off public repo
+*.pdf
+
+# local claude settings
+.claude/settings.local.json
+
 # debug
 npm-debug.log*
 yarn-debug.log*

@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(npm --version)",
-      "Bash(mv \"/Users/nicholassoh/Desktop/personal-website/Nicholas Soh De Lin Resume.pdf\" /tmp/)",
-      "Bash(npx -y create-next-app@latest . --typescript --tailwind --eslint --app --no-src-dir --import-alias \"@/*\" --turbopack --yes)"
-    ]
-  }
-}
