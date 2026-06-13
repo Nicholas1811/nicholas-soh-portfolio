@@ -6,17 +6,19 @@ import { COLS, ROWS, isWall, items, start, type MazeItem } from "@/lib/maze";
 import SectionHeading from "@/components/ui/SectionHeading";
 
 const FOV = (66 * Math.PI) / 180;
-const MOVE_SPEED = 2.4; // cells / s
-const TURN_SPEED = 2.6; // rad / s
-const PLAYER_RADIUS = 0.22;
+const MOVE_SPEED = 2.4;
+const TURN_SPEED = 2.6;
+const PLAYER_RADIUS = 0.34;
 const PICKUP_DIST = 0.6;
 
 const TEX = 64;
 const TEX_MASK = TEX - 1;
-const FOG_DIST = 11;
-const HAZE: [number, number, number] = [199, 226, 212];
-const SKY_TOP = "#4f9fdd";
-const SKY_HORIZON = "#d6ecf8";
+const LOGICAL = 16; // minecraft textures are 16x16 logical pixels
+const PX = TEX / LOGICAL; // each logical pixel maps to PX texels
+const FOG_DIST = 13;
+const HAZE: [number, number, number] = [199, 226, 240];
+const SKY_TOP = "#7AB7E8";
+const SKY_HORIZON = "#C6E1F0";
 
 function canStand(x: number, y: number) {
   const r = PLAYER_RADIUS;
@@ -34,55 +36,84 @@ function pack(r: number, g: number, b: number): number {
   return (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
 }
 
-// tileable value noise (cell must divide size)
-function makeNoise(size: number, cell: number): Float32Array {
-  const g = size / cell;
-  const grid = new Float32Array(g * g);
-  for (let i = 0; i < grid.length; i++) grid[i] = Math.random();
-  const out = new Float32Array(size * size);
-  for (let y = 0; y < size; y++) {
-    const gy = y / cell;
-    const y0 = Math.floor(gy);
-    const fy = gy - y0;
-    const sy = fy * fy * (3 - 2 * fy);
-    const r0 = (y0 % g) * g;
-    const r1 = ((y0 + 1) % g) * g;
-    for (let x = 0; x < size; x++) {
-      const gx = x / cell;
-      const x0 = Math.floor(gx);
-      const fx = gx - x0;
-      const sx = fx * fx * (3 - 2 * fx);
-      const c0 = x0 % g;
-      const c1 = (x0 + 1) % g;
-      const top = grid[r0 + c0] + (grid[r0 + c1] - grid[r0 + c0]) * sx;
-      const bot = grid[r1 + c0] + (grid[r1 + c1] - grid[r1 + c0]) * sx;
-      out[y * size + x] = top + (bot - top) * sy;
+function paintBlock(out: Uint32Array, lx: number, ly: number, color: number) {
+  const x0 = lx * PX;
+  const y0 = ly * PX;
+  for (let dy = 0; dy < PX; dy++) {
+    const yo = (y0 + dy) * TEX;
+    for (let dx = 0; dx < PX; dx++) {
+      out[yo + x0 + dx] = color;
     }
+  }
+}
+
+// cobblestone — irregular grey stones separated by dark mortar (16x16 logical)
+function makeCobblestoneTexture(): Uint32Array {
+  const out = new Uint32Array(TEX * TEX);
+  const mortar = pack(38, 38, 38);
+  for (let i = 0; i < out.length; i++) out[i] = mortar;
+
+  const shades = [
+    { base: pack(132, 132, 132), hi: pack(172, 172, 172), lo: pack(82, 82, 82) },
+    { base: pack(145, 145, 145), hi: pack(185, 185, 185), lo: pack(92, 92, 92) },
+    { base: pack(115, 115, 115), hi: pack(152, 152, 152), lo: pack(68, 68, 68) },
+  ];
+  type Stone = { x0: number; y0: number; x1: number; y1: number; shade: number };
+  const stones: Stone[] = [
+    { x0: 1, y0: 1, x1: 6, y1: 5, shade: 0 },
+    { x0: 8, y0: 1, x1: 14, y1: 6, shade: 1 },
+    { x0: 1, y0: 7, x1: 4, y1: 13, shade: 2 },
+    { x0: 6, y0: 8, x1: 11, y1: 11, shade: 1 },
+    { x0: 13, y0: 8, x1: 14, y1: 11, shade: 0 },
+    { x0: 6, y0: 13, x1: 14, y1: 14, shade: 2 },
+    { x0: 1, y0: 14, x1: 4, y1: 14, shade: 0 },
+  ];
+  for (const s of stones) {
+    const sh = shades[s.shade];
+    for (let y = s.y0; y <= s.y1; y++) {
+      for (let x = s.x0; x <= s.x1; x++) {
+        let c = sh.base;
+        const r = Math.random();
+        if (r < 0.15) c = sh.lo;
+        else if (r < 0.30) c = sh.hi;
+        paintBlock(out, x, y, c);
+      }
+    }
+    for (let x = s.x0; x <= s.x1; x++) {
+      paintBlock(out, x, s.y0, sh.hi);
+      paintBlock(out, x, s.y1, sh.lo);
+    }
+    for (let y = s.y0; y <= s.y1; y++) {
+      paintBlock(out, s.x0, y, sh.hi);
+      paintBlock(out, s.x1, y, sh.lo);
+    }
+    paintBlock(out, s.x0, s.y0, sh.hi);
+    paintBlock(out, s.x1, s.y1, sh.lo);
   }
   return out;
 }
 
-function lerpC(a: number, b: number, t: number): number {
-  return (a + (b - a) * t) | 0;
-}
-
-function makeHedgeTexture(): Uint32Array {
-  const n1 = makeNoise(TEX, 16);
-  const n2 = makeNoise(TEX, 8);
-  const n3 = makeNoise(TEX, 2);
+// grass top — chunky green pixels
+function makeGrassTopTexture(): Uint32Array {
   const out = new Uint32Array(TEX * TEX);
-  for (let i = 0; i < out.length; i++) {
-    let v = n1[i] * 0.4 + n2[i] * 0.35 + n3[i] * 0.25;
-    v = Math.min(1, Math.max(0, v * 1.25 - 0.12));
-    let r = lerpC(18, 92, v);
-    let g = lerpC(48, 146, v);
-    let b = lerpC(22, 66, v);
-    if (Math.random() < 0.05 && v > 0.55) {
-      r += 28;
-      g += 32;
-      b += 14;
+  const greens = [
+    pack(76, 124, 47),
+    pack(91, 138, 53),
+    pack(105, 153, 62),
+    pack(120, 165, 70),
+    pack(70, 115, 42),
+    pack(95, 145, 55),
+  ];
+  for (let y = 0; y < LOGICAL; y++) {
+    for (let x = 0; x < LOGICAL; x++) {
+      paintBlock(out, x, y, greens[(Math.random() * greens.length) | 0]);
     }
-    out[i] = pack(Math.min(255, r), Math.min(255, g), Math.min(255, b));
+  }
+  for (let i = 0; i < 8; i++) {
+    paintBlock(out, (Math.random() * LOGICAL) | 0, (Math.random() * LOGICAL) | 0, pack(140, 185, 80));
+  }
+  for (let i = 0; i < 4; i++) {
+    paintBlock(out, (Math.random() * LOGICAL) | 0, (Math.random() * LOGICAL) | 0, pack(150, 170, 65));
   }
   return out;
 }
@@ -96,38 +127,9 @@ function darken(tex: Uint32Array, f: number): Uint32Array {
   return out;
 }
 
-function makeGrassTexture(): Uint32Array {
-  const n1 = makeNoise(TEX, 16);
-  const n2 = makeNoise(TEX, 4);
-  const out = new Uint32Array(TEX * TEX);
-  for (let i = 0; i < out.length; i++) {
-    let v = n1[i] * 0.45 + n2[i] * 0.55;
-    v = Math.min(1, Math.max(0, v * 1.2 - 0.08));
-    out[i] = pack(lerpC(34, 98, v), lerpC(74, 152, v), lerpC(30, 58, v));
-  }
-  // grass blades
-  for (let i = 0; i < 320; i++) {
-    const x = (Math.random() * TEX) | 0;
-    const y = (Math.random() * TEX) | 0;
-    const len = 2 + ((Math.random() * 3) | 0);
-    const bright = Math.random() < 0.12;
-    for (let k = 0; k < len; k++) {
-      const idx = (((y + k) & TEX_MASK) * TEX + x) | 0;
-      const c = out[idx];
-      const r = c & 255;
-      const g = (c >> 8) & 255;
-      const b = (c >> 16) & 255;
-      out[idx] = bright
-        ? pack(Math.min(255, r + 60), Math.min(255, g + 55), Math.min(255, b + 10))
-        : pack(Math.min(255, r + 18), Math.min(255, g + 26), Math.min(255, b + 6));
-    }
-  }
-  return out;
-}
-
-const hedgeTex = makeHedgeTexture();
-const hedgeTexDark = darken(hedgeTex, 0.72);
-const grassTex = makeGrassTexture();
+const wallTex = makeCobblestoneTexture();
+const wallTexDark = darken(wallTex, 0.7);
+const grassTex = makeGrassTopTexture();
 
 function fogged(c: number, t: number): number {
   const r = c & 255;
@@ -140,18 +142,6 @@ function fogged(c: number, t: number): number {
   );
 }
 
-function starPath(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
-  ctx.beginPath();
-  for (let i = 0; i < 5; i++) {
-    const a = -Math.PI / 2 + (i * 2 * Math.PI) / 5;
-    if (i === 0) ctx.moveTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
-    else ctx.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
-    const b = a + Math.PI / 5;
-    ctx.lineTo(x + Math.cos(b) * r * 0.45, y + Math.sin(b) * r * 0.45);
-  }
-  ctx.closePath();
-}
-
 function shade(hex: string, amt: number): string {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
   if (!m) return hex;
@@ -161,14 +151,91 @@ function shade(hex: string, amt: number): string {
   return `rgb(${f(n >> 16)},${f((n >> 8) & 255)},${f(n & 255)})`;
 }
 
-const CLOUDS: [number, number, number][] = [
-  [0.06, 0.3, 1.5],
-  [0.22, 0.16, 1.0],
-  [0.38, 0.42, 1.9],
-  [0.55, 0.22, 1.2],
-  [0.71, 0.38, 1.6],
-  [0.88, 0.2, 1.0],
+// pre-rendered ore-block sprite — drawn pixelated at any size via drawImage + no smoothing
+function makeOreBlockSprite(found: boolean): HTMLCanvasElement {
+  const S = 16;
+  const SCALE = 8;
+  const c = document.createElement("canvas");
+  c.width = c.height = S * SCALE;
+  const g = c.getContext("2d")!;
+  g.imageSmoothingEnabled = false;
+  const px = (x: number, y: number, color: string) => {
+    g.fillStyle = color;
+    g.fillRect(x * SCALE, y * SCALE, SCALE, SCALE);
+  };
+  const base = found ? "#6a7a4a" : "#888888";
+  const hi = found ? "#94a36c" : "#aaaaaa";
+  const lo = found ? "#4a5630" : "#555555";
+  const ore = found ? "#506037" : "#ffce4a";
+  const oreHi = found ? "#647645" : "#fff1a8";
+
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) px(x, y, base);
+  for (let i = 0; i < S; i++) {
+    px(i, 0, hi);
+    px(0, i, hi);
+    px(i, S - 1, lo);
+    px(S - 1, i, lo);
+  }
+  const variations: Array<[number, number, string]> = [
+    [3, 3, lo],
+    [10, 2, lo],
+    [2, 9, lo],
+    [12, 11, lo],
+    [5, 6, hi],
+    [11, 8, hi],
+    [3, 13, hi],
+  ];
+  for (const [x, y, col] of variations) px(x, y, col);
+  const orePattern: Array<[number, number]> = [
+    [3, 2], [4, 2], [3, 3],
+    [9, 3], [10, 3], [11, 3], [10, 4],
+    [2, 7], [3, 7], [3, 8],
+    [7, 8], [8, 8], [9, 8], [8, 9],
+    [11, 11], [12, 11], [11, 12],
+    [5, 12], [6, 12],
+  ];
+  for (const [x, y] of orePattern) px(x, y, ore);
+  px(3, 2, oreHi);
+  px(10, 3, oreHi);
+  px(2, 7, oreHi);
+  px(7, 8, oreHi);
+  px(11, 11, oreHi);
+  px(5, 12, oreHi);
+  return c;
+}
+
+let oreSpriteActive: HTMLCanvasElement | null = null;
+let oreSpriteFound: HTMLCanvasElement | null = null;
+
+const CLOUDS: [number, number, "sm" | "md" | "lg"][] = [
+  [0.06, 0.30, "lg"],
+  [0.23, 0.16, "sm"],
+  [0.39, 0.42, "md"],
+  [0.56, 0.22, "sm"],
+  [0.72, 0.38, "lg"],
+  [0.88, 0.18, "md"],
 ];
+
+const CLOUD_SHAPES: Record<string, [number, number][]> = {
+  sm: [
+    [1, 0], [2, 0], [3, 0],
+    [0, 1], [1, 1], [2, 1], [3, 1], [4, 1],
+    [1, 2], [2, 2], [3, 2],
+  ],
+  md: [
+    [2, 0], [3, 0], [4, 0], [5, 0],
+    [1, 1], [2, 1], [3, 1], [4, 1], [5, 1], [6, 1],
+    [0, 2], [1, 2], [2, 2], [3, 2], [4, 2], [5, 2], [6, 2], [7, 2],
+    [1, 3], [2, 3], [3, 3], [4, 3], [5, 3],
+  ],
+  lg: [
+    [2, 0], [3, 0], [4, 0], [5, 0], [6, 0],
+    [1, 1], [2, 1], [3, 1], [4, 1], [5, 1], [6, 1], [7, 1], [8, 1],
+    [0, 2], [1, 2], [2, 2], [3, 2], [4, 2], [5, 2], [6, 2], [7, 2], [8, 2], [9, 2],
+    [1, 3], [2, 3], [3, 3], [4, 3], [5, 3], [6, 3], [7, 3], [8, 3],
+    [3, 4], [4, 4], [5, 4], [6, 4],
+  ],
+};
 
 export default function MazeDetour() {
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -201,11 +268,12 @@ export default function MazeDetour() {
     if (!canvas || !wrap) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    if (!oreSpriteActive) oreSpriteActive = makeOreBlockSprite(false);
+    if (!oreSpriteFound) oreSpriteFound = makeOreBlockSprite(true);
 
     let W = 0;
     let H = 0;
     let dpr = 1;
-    // low-res buffer the raycaster draws into, scaled up on the main canvas
     let RW = 0;
     let RH = 0;
     let buffer: HTMLCanvasElement | null = null;
@@ -224,40 +292,47 @@ export default function MazeDetour() {
       c.width = skyW;
       c.height = skyH;
       const g = c.getContext("2d")!;
+      g.imageSmoothingEnabled = false;
+
       const grad = g.createLinearGradient(0, 0, 0, skyH);
       grad.addColorStop(0, SKY_TOP);
-      grad.addColorStop(1, SKY_HORIZON);
+      grad.addColorStop(0.78, SKY_HORIZON);
+      grad.addColorStop(1, "#dceaf1");
       g.fillStyle = grad;
       g.fillRect(0, 0, skyW, skyH);
 
-      const sunX = skyW * 0.55;
-      const sunY = skyH * 0.32;
-      const sunR = skyH * 0.16;
-      const glow = g.createRadialGradient(sunX, sunY, sunR * 0.3, sunX, sunY, sunR * 4);
-      glow.addColorStop(0, "rgba(255,246,200,0.95)");
-      glow.addColorStop(1, "rgba(255,246,200,0)");
-      g.fillStyle = glow;
-      g.fillRect(sunX - sunR * 4, sunY - sunR * 4, sunR * 8, sunR * 8);
-      g.fillStyle = "#fff4b8";
-      g.beginPath();
-      g.arc(sunX, sunY, sunR, 0, Math.PI * 2);
-      g.fill();
+      const cloudPx = Math.max(3, (skyH / 26) | 0);
+      const sunSize = cloudPx * 8;
+      const sunX = Math.round(skyW * 0.55 - sunSize / 2);
+      const sunY = Math.round(skyH * 0.30 - sunSize / 2);
 
-      for (const [u, v, s] of CLOUDS) {
+      g.fillStyle = "rgba(255,243,180,0.18)";
+      g.fillRect(sunX - sunSize * 0.5, sunY - sunSize * 0.5, sunSize * 2, sunSize * 2);
+      g.fillStyle = "rgba(255,243,180,0.30)";
+      g.fillRect(sunX - sunSize * 0.2, sunY - sunSize * 0.2, sunSize * 1.4, sunSize * 1.4);
+
+      g.fillStyle = "#fff5b5";
+      g.fillRect(sunX, sunY, sunSize, sunSize);
+      g.fillStyle = "#fffce0";
+      g.fillRect(sunX + cloudPx, sunY + cloudPx, sunSize - cloudPx * 2, sunSize - cloudPx * 2);
+
+      g.fillStyle = "rgba(255,255,255,0.92)";
+      for (const [u, v, kind] of CLOUDS) {
         const cx = u * skyW;
-        const cy = (0.12 + v * 0.4) * skyH;
-        const cw = skyH * 0.5 * s;
-        g.fillStyle = "rgba(255,255,255,0.55)";
-        for (const [ox, oy, or] of [
-          [0, 0, 1],
-          [-0.7, 0.15, 0.7],
-          [0.7, 0.18, 0.75],
-          [0.25, -0.3, 0.6],
-          [-0.3, -0.25, 0.55],
-        ] as const) {
-          g.beginPath();
-          g.ellipse(cx + ox * cw, cy + oy * cw * 0.8, cw * or, cw * or * 0.55, 0, 0, Math.PI * 2);
-          g.fill();
+        const cy = (0.10 + v * 0.40) * skyH;
+        const shape = CLOUD_SHAPES[kind];
+        for (const [dx, dy] of shape) {
+          g.fillRect(Math.round(cx + dx * cloudPx), Math.round(cy + dy * cloudPx), cloudPx + 0.5, cloudPx + 0.5);
+        }
+      }
+      // cloud underside shadow
+      g.fillStyle = "rgba(40,80,110,0.10)";
+      for (const [u, v, kind] of CLOUDS) {
+        const cx = u * skyW;
+        const cy = (0.10 + v * 0.40) * skyH;
+        const shape = CLOUD_SHAPES[kind];
+        for (const [dx, dy] of shape) {
+          g.fillRect(Math.round(cx + dx * cloudPx), Math.round(cy + (dy + 1) * cloudPx), cloudPx + 0.5, 2);
         }
       }
       skyData = new Uint32Array(g.getImageData(0, 0, skyW, skyH).data.buffer);
@@ -272,8 +347,9 @@ export default function MazeDetour() {
       canvas.style.width = `${W}px`;
       canvas.style.height = `${H}px`;
 
-      RW = Math.max(240, Math.min(460, Math.round(W * 0.45)));
-      RH = Math.max(140, Math.round((RW * H) / W));
+      // lower internal res for chunky pixelated upscale
+      RW = Math.max(210, Math.min(400, Math.round(W * 0.36)));
+      RH = Math.max(130, Math.round((RW * H) / W));
       if (RH % 2 === 1) RH++;
       buffer = document.createElement("canvas");
       buffer.width = RW;
@@ -331,7 +407,6 @@ export default function MazeDetour() {
       if (++paletteTick % 30 === 0) readPalette();
       if (!bctx || !img || !px32 || !skyData || !buffer) return;
 
-      // --- update ---
       const p = player.current;
       const k = keys.current;
       let walk = 0;
@@ -346,7 +421,6 @@ export default function MazeDetour() {
       }
       checkPickup();
 
-      // --- raycast into low-res buffer ---
       const dirX = Math.cos(p.angle);
       const dirY = Math.sin(p.angle);
       const planeScale = Math.tan(FOV / 2);
@@ -386,7 +460,6 @@ export default function MazeDetour() {
         const perpDist = Math.max(0.05, side === 0 ? sideX - deltaX : sideY - deltaY);
         zBuffer[x] = perpDist;
 
-        // wall hit point in world coords (for texturing + floor casting)
         let hitX: number;
         let hitY: number;
         if (side === 0) {
@@ -404,9 +477,8 @@ export default function MazeDetour() {
         const ys = Math.max(0, Math.ceil(y0));
         const ye = Math.min(RH - 1, Math.floor(halfRH + lineH / 2));
         const wallFog = Math.min(0.82, Math.max(0, (perpDist - 1.2) / FOG_DIST));
-        const wallTex = side === 1 ? hedgeTexDark : hedgeTex;
+        const wallTexN = side === 1 ? wallTexDark : wallTex;
 
-        // sky (panorama sample, parallaxes with view angle)
         const colAngle = p.angle + Math.atan(cameraX * planeScale);
         let su = (colAngle / TWO_PI) % 1;
         if (su < 0) su += 1;
@@ -416,16 +488,15 @@ export default function MazeDetour() {
           buf[y * RW + x] = sky[syr * skyW + sx];
         }
 
-        // textured wall column
         const texStep = TEX / lineH;
         let texPos = (ys - y0) * texStep;
         for (let y = ys; y <= ye; y++) {
           const ty = texPos & TEX_MASK;
           texPos += texStep;
-          buf[y * RW + x] = wallFog > 0.01 ? fogged(wallTex[ty * TEX + texX], wallFog) : wallTex[ty * TEX + texX];
+          buf[y * RW + x] =
+            wallFog > 0.01 ? fogged(wallTexN[ty * TEX + texX], wallFog) : wallTexN[ty * TEX + texX];
         }
 
-        // floor casting (perspective-correct grass)
         for (let y = ye + 1; y < RH; y++) {
           const curDist = RH / (2 * y - RH);
           const w = curDist / perpDist;
@@ -441,12 +512,12 @@ export default function MazeDetour() {
 
       bctx.putImageData(img, 0, 0);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingEnabled = false;
       ctx.drawImage(buffer, 0, 0, RW, RH, 0, 0, W, H);
 
       const horizon = H / 2;
 
-      // --- item sprites (XP orbs) ---
+      // --- floating ore-block items ---
       const sprites = items
         .map((item) => {
           const relX = item.col + 0.5 - p.x;
@@ -465,303 +536,192 @@ export default function MazeDetour() {
         if (zi < 0 || zi >= RW || zBuffer[zi] < depth) continue;
 
         const isFound = foundRef.current.has(item.id);
-        const pulse = isFound ? 1 : 1 + 0.1 * Math.sin(now / 260);
-        const r = Math.min(H * 0.45, (H / depth) * 0.2 * pulse);
-        const float = isFound ? 0 : Math.sin(now / 420 + item.col) * r * 0.12;
-        const cy = horizon + (H / depth) * 0.18 + float;
+        const baseSize = Math.min(H * 0.5, (H / depth) * 0.32);
+        const float = isFound ? 0 : Math.sin(now / 520 + item.col) * baseSize * 0.10;
+        const cy = horizon + (H / depth) * 0.20 + float;
+        const half = baseSize / 2;
+        const x0 = Math.round(screenX - half);
+        const y0 = Math.round(cy - half);
+        const size = Math.round(baseSize);
 
-        ctx.globalAlpha = 0.2;
-        ctx.fillStyle = "#1d3a1d";
+        ctx.globalAlpha = 0.28;
+        ctx.fillStyle = "#0d1d0d";
         ctx.beginPath();
-        ctx.ellipse(screenX, horizon + (H / depth) * 0.18 + r * 0.95, r * 0.8, r * 0.22, 0, 0, Math.PI * 2);
+        ctx.ellipse(screenX, horizon + (H / depth) * 0.22 + half * 0.8, half * 0.95, half * 0.22, 0, 0, Math.PI * 2);
         ctx.fill();
         ctx.globalAlpha = 1;
 
-        if (isFound) ctx.globalAlpha = 0.45;
-        else {
-          const orbGlow = ctx.createRadialGradient(screenX, cy, r * 0.5, screenX, cy, r * 1.8);
-          orbGlow.addColorStop(0, "rgba(255,215,90,0.45)");
-          orbGlow.addColorStop(1, "rgba(255,215,90,0)");
-          ctx.fillStyle = orbGlow;
-          ctx.beginPath();
-          ctx.arc(screenX, cy, r * 1.8, 0, Math.PI * 2);
-          ctx.fill();
+        if (!isFound) {
+          const glow = ctx.createRadialGradient(screenX, cy, half * 0.5, screenX, cy, half * 2);
+          glow.addColorStop(0, "rgba(255,210,70,0.32)");
+          glow.addColorStop(1, "rgba(255,210,70,0)");
+          ctx.fillStyle = glow;
+          ctx.fillRect(x0 - half, y0 - half, size + half * 2, size + half * 2);
         }
 
-        const orb = ctx.createRadialGradient(screenX - r * 0.3, cy - r * 0.3, r * 0.15, screenX, cy, r);
-        if (isFound) {
-          orb.addColorStop(0, "#d9e2cc");
-          orb.addColorStop(1, palette.sage);
-        } else {
-          orb.addColorStop(0, "#fff3b8");
-          orb.addColorStop(1, "#f2a72e");
-        }
-        ctx.fillStyle = orb;
-        ctx.beginPath();
-        ctx.arc(screenX, cy, r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = isFound ? "rgba(60,80,45,0.6)" : "#cf831c";
-        ctx.lineWidth = Math.max(1, r * 0.08);
-        ctx.stroke();
-
-        ctx.fillStyle = "#ffffff";
-        starPath(ctx, screenX, cy + r * 0.03, r * 0.55);
-        ctx.fill();
+        if (isFound) ctx.globalAlpha = 0.55;
+        const sprite = isFound ? oreSpriteFound : oreSpriteActive;
+        if (sprite) ctx.drawImage(sprite, x0, y0, size, size);
         ctx.globalAlpha = 1;
       }
 
-      // --- mini-me, seen from behind ---
+      // --- Steve (blocky back-view) ---
       const moving = walk !== 0 || drag.current !== null;
       walkAmp += ((moving ? 1 : 0) - walkAmp) * Math.min(1, dt * 8);
       const swing = Math.sin(bob.current) * walkAmp;
-      const u = Math.max(14, H * 0.058);
+      const u = Math.max(18, H * 0.075);
+      const bobY = Math.abs(Math.cos(bob.current)) * u * 0.14 * walkAmp;
       const cx = W / 2;
-      const bobY = Math.abs(Math.cos(bob.current)) * u * 0.16 * walkAmp;
-      const feetY = H - u * 0.3 - bobY;
+      const feetY = H - u * 0.18 - bobY;
+      const SPX = u / 4.5; // size of one Minecraft pixel
+      const STEVE_H = 32; // logical pixels tall
+      const topY = Math.round(feetY - STEVE_H * SPX);
+      const baseLeft = Math.round(cx - 8 * SPX);
 
-      const SKIN = "#e3a973";
-      const SKIN_DARK = "#c98e5d";
-      const HAIR_LIGHT = "#4a3522";
-      const HAIR_DARK = "#1c120a";
-      const shirtBase = palette.accent;
-      const shirtLight = shade(palette.accent, 0.28);
-      const shirtDark = shade(palette.accent, -0.32);
-      const PANTS = "#3b4668";
-      const PANTS_DARK = "#2a3350";
-      const SHOES = "#241f1a";
-      const SOLE = "#9b8468";
-      const OUTLINE = "rgba(22,16,10,0.45)";
+      const drawSp = (lx: number, ly: number, w: number, h: number, color: string) => {
+        ctx.fillStyle = color;
+        ctx.fillRect(baseLeft + lx * SPX, topY + ly * SPX, w * SPX + 0.5, h * SPX + 0.5);
+      };
 
-      // soft ground shadow
-      const shGrad = ctx.createRadialGradient(cx, H - u * 0.15, u * 0.2, cx, H - u * 0.15, u * 2);
-      shGrad.addColorStop(0, "rgba(15,30,15,0.4)");
-      shGrad.addColorStop(1, "rgba(15,30,15,0)");
-      ctx.fillStyle = shGrad;
+      const HAIR = "#2d1c0a";
+      const HAIR_HL = "#4a3018";
+      const SKIN_C = "#e2a36b";
+      const SKIN_SH = "#b87a48";
+      const SHIRT = palette.accent;
+      const SHIRT_HL = shade(palette.accent, 0.22);
+      const SHIRT_SH = shade(palette.accent, -0.28);
+      const PANTS_C = "#3b4668";
+      const PANTS_SH = "#2a3350";
+      const SHOES_C = "#1a1610";
+
+      // ground shadow oval
+      const sh = ctx.createRadialGradient(cx, H - u * 0.05, u * 0.2, cx, H - u * 0.05, u * 1.9);
+      sh.addColorStop(0, "rgba(12,28,12,0.45)");
+      sh.addColorStop(1, "rgba(12,28,12,0)");
+      ctx.fillStyle = sh;
       ctx.save();
-      ctx.translate(cx, H - u * 0.15);
+      ctx.translate(cx, H - u * 0.05);
       ctx.scale(1, 0.22);
       ctx.beginPath();
-      ctx.arc(0, 0, u * 2, 0, Math.PI * 2);
+      ctx.arc(0, 0, u * 1.9, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
 
-      const hipY = feetY - u * 2.1;
-      const liftL = Math.max(0, swing) * u * 0.55;
-      const liftR = Math.max(0, -swing) * u * 0.55;
+      // subtle head sway with stride
+      const headSway = Math.round(swing * 0.8); // -1, 0, 1 logical px
 
-      // legs (jeans with shaded inner edge), knees bend slightly on lift
-      ctx.lineCap = "round";
-      for (const [sgn, lift] of [
-        [-1, liftL],
-        [1, liftR],
-      ] as const) {
-        const lx = cx + sgn * u * 0.45;
-        const kneeY = hipY + (feetY - hipY) * 0.5 - lift * 0.4;
-        const kneeX = lx + sgn * lift * 0.12;
-        const footY = feetY - lift;
-        ctx.strokeStyle = PANTS;
-        ctx.lineWidth = u * 0.62;
-        ctx.beginPath();
-        ctx.moveTo(lx, hipY);
-        ctx.lineTo(kneeX, kneeY);
-        ctx.lineTo(lx, footY - u * 0.28);
-        ctx.stroke();
-        // inner-edge shading + center seam
-        ctx.strokeStyle = PANTS_DARK;
-        ctx.lineWidth = u * 0.16;
-        ctx.beginPath();
-        ctx.moveTo(lx - sgn * u * 0.2, hipY + u * 0.1);
-        ctx.lineTo(kneeX - sgn * u * 0.2, kneeY);
-        ctx.lineTo(lx - sgn * u * 0.2, footY - u * 0.32);
-        ctx.stroke();
+      // HEAD (8x8 cube, cols 4-11, rows 0-7) — flat back face, all hair
+      drawSp(4 + headSway, 0, 8, 8, HAIR);
+      // top edge (sun-lit) and bottom edge (head-to-body shadow) — gives the cube depth
+      drawSp(4 + headSway, 0, 8, 1, HAIR_HL);
+      drawSp(4 + headSway, 7, 8, 1, "#1a0f06");
+      // a few scattered HAIR_HL strands for skin/hair texture
+      drawSp(5 + headSway, 2, 1, 1, HAIR_HL);
+      drawSp(8 + headSway, 1, 1, 1, HAIR_HL);
+      drawSp(10 + headSway, 4, 1, 1, HAIR_HL);
+      drawSp(6 + headSway, 5, 1, 1, HAIR_HL);
+      drawSp(9 + headSway, 6, 1, 1, HAIR_HL);
 
-        // shoe (sole shows when the foot lifts)
-        if (lift > u * 0.08) {
-          ctx.fillStyle = SOLE;
-          ctx.beginPath();
-          ctx.ellipse(lx, footY + u * 0.1, u * 0.4, u * 0.22, 0, 0, Math.PI * 2);
-          ctx.fill();
+      // TORSO (8x12, cols 4-11, rows 8-19)
+      drawSp(4, 8, 8, 12, SHIRT);
+      drawSp(4, 8, 1, 12, SHIRT_HL);
+      drawSp(11, 8, 1, 12, SHIRT_SH);
+      drawSp(4, 8, 8, 1, SHIRT_HL);
+      drawSp(4, 19, 8, 1, SHIRT_SH);
+      drawSp(7, 9, 1, 10, SHIRT_SH);
+
+      // ARMS swing opposite to same-side leg (contralateral) so the walk reads naturally.
+      // RIGHT ARM (viewer's left, cols 0-3, rows 8-19)
+      const rArmUp = Math.max(0, Math.round(-swing));  // forward when LEFT leg forward
+      drawSp(0, 8 - rArmUp, 4, 10, SHIRT);
+      drawSp(0, 8 - rArmUp, 4, 1, SHIRT_HL);
+      drawSp(0, 8 - rArmUp, 1, 10, SHIRT_HL);
+      drawSp(3, 8 - rArmUp, 1, 10, SHIRT_SH);
+      drawSp(0, 18 - rArmUp, 4, 2, SKIN_C);
+      drawSp(3, 18 - rArmUp, 1, 2, SKIN_SH);
+
+      // LEFT ARM (viewer's right, cols 12-15, rows 8-19)
+      const lArmUp = Math.max(0, Math.round(swing));   // forward when RIGHT leg forward
+      drawSp(12, 8 - lArmUp, 4, 10, SHIRT);
+      drawSp(12, 8 - lArmUp, 4, 1, SHIRT_HL);
+      drawSp(12, 8 - lArmUp, 1, 10, SHIRT_HL);
+      drawSp(15, 8 - lArmUp, 1, 10, SHIRT_SH);
+      drawSp(12, 18 - lArmUp, 4, 2, SKIN_C);
+      drawSp(15, 18 - lArmUp, 1, 2, SKIN_SH);
+
+      // LEGS — hip fixed at row 20, foot rises when swinging forward.
+      const LEG_LIFT_MAX = 3; // logical px of foot lift
+      const liftR = Math.round(Math.max(0, swing) * LEG_LIFT_MAX);
+      const liftL = Math.round(Math.max(0, -swing) * LEG_LIFT_MAX);
+      const drawLeg = (xCol: number, lift: number) => {
+        const shoesTop = 30 - lift;            // 2-row shoe
+        const pantsH = shoesTop - 20;          // pants compress as leg lifts (knee bend)
+        if (pantsH > 0) {
+          drawSp(xCol, 20, 4, pantsH, PANTS_C);
+          drawSp(xCol, 20, 4, 1, "rgba(255,255,255,0.10)");
+          drawSp(xCol + 3, 20, 1, pantsH, PANTS_SH);
         }
-        ctx.fillStyle = SHOES;
-        ctx.beginPath();
-        ctx.ellipse(lx, footY, u * 0.42, u * 0.26, 0, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = "rgba(255,255,255,0.18)";
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.ellipse(lx, footY - u * 0.06, u * 0.34, u * 0.14, 0, Math.PI, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      // torso (shirt with sun-side highlight, folds, hem)
-      const shoulderY = hipY - u * 2.3;
-      const torso = () => {
-        ctx.beginPath();
-        ctx.moveTo(cx - u * 0.95, hipY + u * 0.2);
-        ctx.lineTo(cx - u * 1.15, shoulderY + u * 0.5);
-        ctx.quadraticCurveTo(cx - u * 1.15, shoulderY - u * 0.15, cx - u * 0.55, shoulderY - u * 0.25);
-        ctx.lineTo(cx + u * 0.55, shoulderY - u * 0.25);
-        ctx.quadraticCurveTo(cx + u * 1.15, shoulderY - u * 0.15, cx + u * 1.15, shoulderY + u * 0.5);
-        ctx.lineTo(cx + u * 0.95, hipY + u * 0.2);
-        ctx.closePath();
+        drawSp(xCol, shoesTop, 4, 2, SHOES_C);
+        // sole shows when foot is lifted
+        if (lift > 0) drawSp(xCol, shoesTop + 1, 4, 1, "#3a3026");
       };
-      const shirtGrad = ctx.createLinearGradient(cx - u * 1.15, shoulderY, cx + u * 1.15, hipY);
-      shirtGrad.addColorStop(0, shirtLight);
-      shirtGrad.addColorStop(0.45, shirtBase);
-      shirtGrad.addColorStop(1, shirtDark);
-      ctx.fillStyle = shirtGrad;
-      torso();
-      ctx.fill();
-      ctx.strokeStyle = OUTLINE;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.save();
-      torso();
-      ctx.clip();
-      ctx.strokeStyle = "rgba(0,0,0,0.14)";
-      ctx.lineWidth = u * 0.08;
-      ctx.beginPath(); // fabric folds
-      ctx.moveTo(cx - u * 0.7, hipY - u * 0.1);
-      ctx.quadraticCurveTo(cx - u * 0.2, hipY - u * 0.5, cx + u * 0.1, hipY - u * 0.05);
-      ctx.moveTo(cx + u * 0.3, hipY - u * 0.3);
-      ctx.quadraticCurveTo(cx + u * 0.7, hipY - u * 0.6, cx + u * 0.85, hipY - u * 0.15);
-      ctx.moveTo(cx - u * 0.9, shoulderY + u * 0.9 + swing * u * 0.2);
-      ctx.quadraticCurveTo(cx, shoulderY + u * 1.15, cx + u * 0.9, shoulderY + u * 0.9 - swing * u * 0.2);
-      ctx.stroke();
-      ctx.fillStyle = "rgba(0,0,0,0.18)"; // hem shadow
-      ctx.fillRect(cx - u * 1.2, hipY - u * 0.02, u * 2.4, u * 0.25);
-      ctx.restore();
+      drawLeg(4, liftR); // right leg (viewer's left)
+      drawLeg(8, liftL); // left  leg (viewer's right)
 
-      // arms: shirt sleeve to elbow, bare forearm + hand below
-      for (const [sgn, handPhase] of [
-        [-1, swing],
-        [1, -swing],
-      ] as const) {
-        const shoulderX = cx + sgn * u * 0.95;
-        const elbowX = cx + sgn * (u * 1.2 + Math.abs(handPhase) * u * 0.06);
-        const elbowY = shoulderY + u * 1.15 + handPhase * u * 0.3;
-        const handX = cx + sgn * (u * 1.28 + Math.abs(handPhase) * u * 0.1);
-        const handY = shoulderY + u * 2.15 + handPhase * u * 0.75;
-        ctx.strokeStyle = sgn < 0 ? shirtLight : shirtDark;
-        ctx.lineWidth = u * 0.46;
-        ctx.beginPath();
-        ctx.moveTo(shoulderX, shoulderY + u * 0.15);
-        ctx.lineTo(elbowX, elbowY);
-        ctx.stroke();
-        ctx.strokeStyle = sgn < 0 ? SKIN : SKIN_DARK;
-        ctx.lineWidth = u * 0.34;
-        ctx.beginPath();
-        ctx.moveTo(elbowX, elbowY);
-        ctx.lineTo(handX, handY - u * 0.15);
-        ctx.stroke();
-        ctx.fillStyle = sgn < 0 ? SKIN : SKIN_DARK;
-        ctx.beginPath();
-        ctx.arc(handX, handY, u * 0.27, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = OUTLINE;
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-
-      // neck + head
-      ctx.fillStyle = SKIN_DARK;
-      ctx.fillRect(cx - u * 0.22, shoulderY - u * 0.75, u * 0.44, u * 0.6);
-      const headX = cx + swing * u * 0.05;
-      const headY = shoulderY - u * 1.55;
-      ctx.fillStyle = SKIN;
-      ctx.beginPath();
-      ctx.arc(headX, headY, u, 0, Math.PI * 2);
-      ctx.fill();
-      // hair (back of head) with sheen + strands
-      const hairGrad = ctx.createRadialGradient(
-        headX - u * 0.4,
-        headY - u * 0.5,
-        u * 0.2,
-        headX,
-        headY,
-        u * 1.05
-      );
-      hairGrad.addColorStop(0, HAIR_LIGHT);
-      hairGrad.addColorStop(1, HAIR_DARK);
-      ctx.fillStyle = hairGrad;
-      ctx.beginPath();
-      ctx.arc(headX, headY - u * 0.06, u * 0.99, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = OUTLINE;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.strokeStyle = "rgba(255,255,255,0.10)";
-      ctx.lineWidth = u * 0.05;
-      for (let i = -2; i <= 2; i++) {
-        ctx.beginPath();
-        ctx.arc(headX + i * u * 0.05, headY - u * 0.06, u * (0.55 + Math.abs(i) * 0.16), -Math.PI * 0.85, -Math.PI * 0.25);
-        ctx.stroke();
-      }
-      // nape edge + ears
-      ctx.strokeStyle = "rgba(0,0,0,0.25)";
-      ctx.lineWidth = u * 0.06;
-      ctx.beginPath();
-      ctx.arc(headX, headY + u * 0.15, u * 0.7, Math.PI * 0.2, Math.PI * 0.8);
-      ctx.stroke();
-      ctx.fillStyle = SKIN;
-      ctx.beginPath();
-      ctx.arc(headX - u * 0.97, headY + u * 0.12, u * 0.17, 0, Math.PI * 2);
-      ctx.arc(headX + u * 0.97, headY + u * 0.12, u * 0.17, 0, Math.PI * 2);
-      ctx.fill();
-
+      // crown when all found
       if (allFoundRef.current) {
-        const s = u * 1.05;
-        const top = headY - u - s * 0.55;
-        ctx.fillStyle = "#f5c542";
-        ctx.beginPath();
-        ctx.moveTo(headX - s * 0.5, top + s * 0.55);
-        ctx.lineTo(headX - s * 0.55, top + s * 0.1);
-        ctx.lineTo(headX - s * 0.22, top + s * 0.32);
-        ctx.lineTo(headX, top);
-        ctx.lineTo(headX + s * 0.22, top + s * 0.32);
-        ctx.lineTo(headX + s * 0.55, top + s * 0.1);
-        ctx.lineTo(headX + s * 0.5, top + s * 0.55);
-        ctx.closePath();
-        ctx.fill();
-        ctx.strokeStyle = "rgba(160,110,20,0.7)";
-        ctx.lineWidth = 1;
-        ctx.stroke();
+        drawSp(4 + headSway, -2, 8, 2, "#f5c542");
+        drawSp(4 + headSway, -4, 1, 2, "#f5c542");
+        drawSp(7 + headSway, -4, 2, 2, "#f5c542");
+        drawSp(11 + headSway, -4, 1, 2, "#f5c542");
+        drawSp(5 + headSway, -3, 1, 1, "#ffe57a");
+        drawSp(8 + headSway, -3, 1, 1, "#ffe57a");
+        drawSp(11 + headSway, -3, 1, 1, "#ffe57a");
+        drawSp(4 + headSway, -1, 8, 1, "#c98a1f");
       }
 
-      // --- minimap ---
+      // --- minimap (top-down, blocky) ---
       const mapW = Math.min(170, W * 0.24);
       const cellPx = mapW / COLS;
       const mapH = cellPx * ROWS;
       const mx = W - mapW - 12;
       const my = 12;
-      ctx.globalAlpha = 0.88;
-      ctx.fillStyle = "#eaf3e2";
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = "#cfe3b4";
       ctx.fillRect(mx, my, mapW, mapH);
       ctx.globalAlpha = 1;
-      ctx.strokeStyle = "rgb(38,88,44)";
+      ctx.strokeStyle = "rgba(40,55,40,0.8)";
       ctx.lineWidth = 1;
       ctx.strokeRect(mx, my, mapW, mapH);
-      ctx.fillStyle = "rgb(52,112,56)";
+      ctx.fillStyle = "#7a7a7a";
       for (let r = 0; r < ROWS; r++)
         for (let c = 0; c < COLS; c++)
           if (isWall(c, r)) ctx.fillRect(mx + c * cellPx, my + r * cellPx, cellPx + 0.5, cellPx + 0.5);
+      // mortar lines on walls for cobble feel
+      ctx.fillStyle = "rgba(40,40,40,0.6)";
+      for (let r = 0; r < ROWS; r++)
+        for (let c = 0; c < COLS; c++)
+          if (isWall(c, r)) ctx.fillRect(mx + c * cellPx, my + r * cellPx, cellPx + 0.5, 1);
       for (const item of items) {
-        ctx.fillStyle = foundRef.current.has(item.id) ? palette.sage : "#f2a72e";
-        ctx.beginPath();
-        ctx.arc(mx + (item.col + 0.5) * cellPx, my + (item.row + 0.5) * cellPx, cellPx * 0.32, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.fillStyle = foundRef.current.has(item.id) ? palette.sage : "#ffce4a";
+        ctx.fillRect(
+          mx + (item.col + 0.18) * cellPx,
+          my + (item.row + 0.18) * cellPx,
+          cellPx * 0.64,
+          cellPx * 0.64
+        );
       }
-      const px = mx + p.x * cellPx;
-      const py = my + p.y * cellPx;
+      const pxm = mx + p.x * cellPx;
+      const pym = my + p.y * cellPx;
       ctx.strokeStyle = palette.accent;
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.moveTo(px, py);
-      ctx.lineTo(px + dirX * cellPx * 1.4, py + dirY * cellPx * 1.4);
+      ctx.moveTo(pxm, pym);
+      ctx.lineTo(pxm + dirX * cellPx * 1.4, pym + dirY * cellPx * 1.4);
       ctx.stroke();
       ctx.fillStyle = palette.accent;
       ctx.beginPath();
-      ctx.arc(px, py, cellPx * 0.4, 0, Math.PI * 2);
+      ctx.arc(pxm, pym, cellPx * 0.4, 0, Math.PI * 2);
       ctx.fill();
     };
 
@@ -801,13 +761,40 @@ export default function MazeDetour() {
     d.lastY = e.clientY;
     const p = player.current;
     p.angle += dx * 0.006;
-    const step = -dy * 0.02;
-    const nx = p.x + Math.cos(p.angle) * step;
-    const ny = p.y + Math.sin(p.angle) * step;
-    if (canStand(nx, p.y)) p.x = nx;
-    if (canStand(p.x, ny)) p.y = ny;
-    bob.current += Math.abs(dy) * 0.02;
+    // Mouse: vertical drag also pushes forward/back. Touch: turn only — buttons handle moving.
+    if (e.pointerType !== "touch") {
+      const step = -dy * 0.02;
+      const nx = p.x + Math.cos(p.angle) * step;
+      const ny = p.y + Math.sin(p.angle) * step;
+      if (canStand(nx, p.y)) p.x = nx;
+      if (canStand(p.x, ny)) p.y = ny;
+      bob.current += Math.abs(dy) * 0.02;
+    }
   };
+
+  const pressKey = (k: string) => keys.current.add(k);
+  const releaseKey = (k: string) => keys.current.delete(k);
+  const touchBtnProps = (keyName: string, ariaLabel: string) => ({
+    type: "button" as const,
+    "data-interactive": true,
+    "aria-label": ariaLabel,
+    onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      pressKey(keyName);
+    },
+    onPointerUp: (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.preventDefault();
+      releaseKey(keyName);
+    },
+    onPointerCancel: () => releaseKey(keyName),
+    onPointerLeave: () => releaseKey(keyName),
+    onLostPointerCapture: () => releaseKey(keyName),
+    onContextMenu: (e: React.MouseEvent) => e.preventDefault(),
+    className:
+      "font-mono touch-none select-none border hairline bg-paper/90 backdrop-blur-sm flex h-14 w-14 items-center justify-center text-xl active:bg-accent active:text-paper transition-colors",
+    style: { borderRadius: "3px 12px 4px 10px" } as React.CSSProperties,
+  });
 
   const onPointerUp = (e: React.PointerEvent) => {
     if (drag.current?.id === e.pointerId) drag.current = null;
@@ -819,8 +806,7 @@ export default function MazeDetour() {
 
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <p className="font-mono text-xs uppercase tracking-[0.2em] opacity-50">
-          (walk the maze in first person — ↑↓ to move, ←→ to turn, or drag. find everything i&apos;ve
-          shipped.)
+          (walk the maze — keys, drag, or tap the on-screen pad. find everything i&apos;ve shipped.)
         </p>
         <div className="flex items-center gap-4">
           <p className="font-mono text-xs uppercase tracking-[0.2em]">
@@ -878,6 +864,18 @@ export default function MazeDetour() {
           </AnimatePresence>
         </motion.div>
 
+        {/* Mobile / touch controls — overlay sits outside the drag region so taps don't start a drag */}
+        <div className="pointer-events-none absolute inset-0 z-10 md:hidden">
+          <div className="pointer-events-auto absolute bottom-3 left-3 flex flex-col gap-2">
+            <button {...touchBtnProps("w", "Move forward")}>↑</button>
+            <button {...touchBtnProps("s", "Move backward")}>↓</button>
+          </div>
+          <div className="pointer-events-auto absolute bottom-3 right-3 flex gap-2">
+            <button {...touchBtnProps("a", "Turn left")}>←</button>
+            <button {...touchBtnProps("d", "Turn right")}>→</button>
+          </div>
+        </div>
+
         <AnimatePresence>
           {popup && (
             <motion.div
@@ -885,7 +883,7 @@ export default function MazeDetour() {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 8, scale: 0.95 }}
               transition={{ type: "spring", stiffness: 320, damping: 24 }}
-              className="absolute inset-x-4 bottom-4 z-20 mx-auto max-w-md border hairline bg-paper p-5 shadow-[5px_8px_0_rgba(24,22,17,0.2)] md:inset-x-auto md:right-6 md:bottom-6"
+              className="absolute inset-x-4 top-4 z-20 mx-auto max-w-md border hairline bg-paper p-5 shadow-[5px_8px_0_rgba(24,22,17,0.2)] md:inset-x-auto md:right-6 md:bottom-6 md:top-auto"
               style={{ borderRadius: "3px 16px 4px 14px" }}
             >
               <button
